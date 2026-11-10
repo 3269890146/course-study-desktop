@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>章节测验重复内部题号</title>
+<body>
+<h1>章节测验</h1>
+<p>题量：40</p>
+<main class="ZyBottom ans-cc"></main>
+<script>
+// 按实机诊断还原题卡层次，模拟不同题型组重用内部序号的情况。
+const paper = document.querySelector('main');
+for (const [type, first, last, options] of [
+    ['单选题', 1, 20, ['甲', '乙', '丙', '丁']],
+    ['多选题', 21, 30, ['甲', '乙', '丙', '丁']],
+    ['判断题', 31, 40, ['对', '错']]
+]) {
+    const section = document.createElement('h2');
+    section.textContent = `${type}（共${last - first + 1}题）`;
+    paper.append(section);
+    for (let number = first; number <= last; number++) {
+        const outer = document.createElement('div');
+        outer.className = 'singleQuesId';
+        const optionsHtml = options.map((option, index) => `
+            <li class="${type === '多选题' ? 'before-after-checkbox' : 'font-cxsecret before-after'}">
+                <label class="fl before">${String.fromCharCode(65 + index)}</label> <span>${option}</span>
+            </li>`).join('');
+        outer.innerHTML = `<div class="TiMu newTiMu" data="${number - first + 1}">
+            <div class="Zy_TItle clearfix"><div class="clearfix font-cxsecret fontLabel">
+                ${number} <span class="newZy_TItle">【${type}】</span> 第 ${number} 道题
+            </div></div>
+            <ul class="Zy_ulTop">${optionsHtml}</ul>
+        </div>`;
+        paper.append(outer);
+    }
+}
+</script>
+</body>
+</html>

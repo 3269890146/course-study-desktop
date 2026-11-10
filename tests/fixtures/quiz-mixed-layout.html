@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>混合页面结构的章节测验</title>
+<body>
+<h1>章节测验</h1>
+<p>题量：40</p>
+<main id="paper"></main>
+<script>
+// 同一试卷中，部分题目依赖已知类名，部分题目只能通过题型标签识别。
+const paper = document.getElementById('paper');
+for (const [name, start, end, options] of [
+    ['单选题', 1, 20, ['甲', '乙', '丙', '丁']],
+    ['多选题', 21, 30, ['甲', '乙', '丙', '丁']],
+    ['判断题', 31, 40, ['对', '错']]
+]) {
+    const section = document.createElement('section');
+    section.innerHTML = `<h2>${name}（共${end - start + 1}题）</h2>`;
+    for (let i = start; i <= end; i++) {
+        const card = document.createElement('div');
+        if (start === 1) {
+            card.className = 'Py-mian1 singleQuesId';
+            card.innerHTML = `<span class="question-type">单选</span><div class="question-stem">第 ${i} 道题</div>`;
+        } else {
+            card.innerHTML = `<div>${i}【${name}】第 ${i} 道题</div>`;
+        }
+        for (let j = 0; j < options.length; j++) {
+            card.innerHTML += `<div><span>${String.fromCharCode(65 + j)}</span> <span>${options[j]}</span></div>`;
+        }
+        section.append(card);
+    }
+    paper.append(section);
+}
+</script>
+</body>
+</html>
