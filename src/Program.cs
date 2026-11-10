@@ -451,7 +451,6 @@ namespace XuexitongDesktop
                     }
                     // 页面加载完成后自动识别一次当前章节标题
                     await player.StepOnceAsync(false);
-                    status.Text = "页面已加载。可使用「连续播放」、「开始答题」或「截图/文字查题与设置」。";
                 };
                 browser.CoreWebView2.Navigate("https://i.chaoxing.com/");
             }
@@ -484,7 +483,6 @@ namespace XuexitongDesktop
                     popup.Controls.Add(child);
                     popup.Controls.Add(popupStatusBar);
                     popup.Controls.Add(toolbar);
-                    popup.FormClosed += async delegate { await popupPlayer.PauseAsync(); };
                     popup.Show(this);
 
                     await child.EnsureCoreWebView2Async(environment);

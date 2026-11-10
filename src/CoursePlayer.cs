@@ -1,4 +1,4 @@
-﻿/*
+/*
  * 文件说明：CoursePlayer.cs
  * 职责角色：本文件实现学习通课程的连续播放、暂停/继续、当前章节识别、平台任务点完成状态核对以及自动切换下一节。
  *           核心原则：
@@ -57,9 +57,13 @@ namespace XuexitongDesktop
         private readonly ToolStripStatusLabel statusLabel;
         private readonly ToolStripLabel chapterLabel;
         private readonly Timer monitorTimer;
+        private readonly System.Threading.SemaphoreSlim playbackGate = new System.Threading.SemaphoreSlim(1);
         private bool isRunning;
-        private bool isBusy;
+        private bool disposed;
+        private int playbackVersion;
         private int endedWithoutJobFinishTicks;
+        private string readingProbeKey;
+        private string lastReadingAdvanceKey;
         private const int MaxWaitJobFinishTicks = 4;
 
         internal bool IsRunning
@@ -74,6 +78,13 @@ namespace XuexitongDesktop
             this.chapterLabel = chapterLabel;
             this.monitorTimer = new Timer { Interval = 1200 };
             this.monitorTimer.Tick += async delegate { await OnMonitorTickAsync(); };
+            browser.Disposed += delegate
+            {
+                disposed = true;
+                isRunning = false;
+                playbackVersion++;
+                monitorTimer.Dispose();
+            };
         }
 
         /// <summary>
@@ -81,8 +92,12 @@ namespace XuexitongDesktop
         /// </summary>
         internal async Task StartOrResumeAsync()
         {
+            if (disposed) return;
+            playbackVersion++;
             isRunning = true;
             endedWithoutJobFinishTicks = 0;
+            readingProbeKey = null;
+            lastReadingAdvanceKey = null;
             monitorTimer.Start();
             await StepOnceAsync(true);
         }
@@ -92,42 +107,56 @@ namespace XuexitongDesktop
         /// </summary>
         internal async Task PauseAsync()
         {
+            if (disposed) return;
+            int version = ++playbackVersion;
             isRunning = false;
             monitorTimer.Stop();
-            if (!IsValidChaoxingUrl(browser))
-            {
-                UpdateUi("", "请先打开学习通课程页面。");
-                return;
-            }
+            if (statusLabel != null) statusLabel.Text = "正在暂停视频……";
+            // 等当前巡检退出，再暂停播放器，避免上一轮播放指令晚到。
+            await playbackGate.WaitAsync();
             try
             {
-                string chapter = await PauseVideosInPageAsync(browser);
-                UpdateUi(chapter, "已暂停播放（点击「连续播放」可继续）。");
+                if (version != playbackVersion || disposed) return;
+                if (!IsValidChaoxingUrl(browser))
+                {
+                    UpdateUi("", "请先打开学习通课程页面。");
+                    return;
+                }
+                var result = await PauseVideosInPageAsync(browser);
+                if (version != playbackVersion || disposed) return;
+                UpdateUi(result.Item1, result.Item2
+                    ? "已暂停播放（点击「连续播放」可继续）。"
+                    : "连续播放已停止，未能确认网页视频已暂停。请检查播放器。");
             }
             catch (Exception ex)
             {
-                UpdateUi("", "暂停视频失败：" + ex.Message);
+                if (version == playbackVersion && !disposed) UpdateUi("", "暂停视频失败：" + ex.Message);
             }
+            finally { playbackGate.Release(); }
         }
 
         private async Task OnMonitorTickAsync()
         {
-            if (!isRunning || isBusy) return;
-            isBusy = true;
-            try
-            {
-                await StepOnceAsync(true);
-            }
-            finally
-            {
-                isBusy = false;
-            }
+            if (disposed || !isRunning || playbackGate.CurrentCount == 0) return;
+            await StepOnceAsync(true);
         }
 
         /// <summary>
         /// 执行单步巡检与控制：识别章节、检测拦截状态、恢复播放、核对平台完成标记并在确认完成后自动切章。
         /// </summary>
         internal async Task<CourseStepSnapshot> StepOnceAsync(bool autoPlayAndAdvance)
+        {
+            int version = playbackVersion;
+            await playbackGate.WaitAsync();
+            try
+            {
+                if (version != playbackVersion || disposed) return new CourseStepSnapshot();
+                return await InspectAndPlayAsync(autoPlayAndAdvance, version);
+            }
+            finally { playbackGate.Release(); }
+        }
+
+        private async Task<CourseStepSnapshot> InspectAndPlayAsync(bool autoPlayAndAdvance, int version)
         {
             var snap = new CourseStepSnapshot();
             if (!IsValidChaoxingUrl(browser))
@@ -143,9 +172,12 @@ namespace XuexitongDesktop
             {
                 string inspectScript = BuildInspectScript(autoPlayAndAdvance);
                 string rawJson = await browser.ExecuteScriptAsync(inspectScript);
+                if (version != playbackVersion || disposed) return snap;
                 var serializer = new JavaScriptSerializer();
                 string json = serializer.Deserialize<string>(rawJson);
                 var data = serializer.Deserialize<Dictionary<string, object>>(json);
+                bool canAdvanceReading = GetBool(data, "canAdvanceReading");
+                bool hasVideoOrQuiz = GetBool(data, "hasVideoOrQuiz");
 
                 snap.GuardBlocked = GetBool(data, "guardBlocked");
                 snap.GuardReason = GetString(data, "guardReason");
@@ -166,10 +198,12 @@ namespace XuexitongDesktop
                     try
                     {
                         string fRaw = await WebViewFrameRegistry.ExecuteCourseFrameScriptAsync(frame, inspectScript);
+                        if (version != playbackVersion || disposed) return snap;
                         string fJson = serializer.Deserialize<string>(fRaw);
                         if (String.IsNullOrEmpty(fJson)) continue;
                         var fData = serializer.Deserialize<Dictionary<string, object>>(fJson);
                         if (fData == null) continue;
+                        hasVideoOrQuiz |= GetBool(fData, "hasVideoOrQuiz");
 
                         if (GetBool(fData, "guardBlocked") && !snap.GuardBlocked)
                         {
@@ -198,6 +232,10 @@ namespace XuexitongDesktop
                     {
                     }
                 }
+                if (version != playbackVersion || disposed) return snap;
+
+                if (snap.GuardBlocked || snap.SwitchedToVideoTab || snap.VideoCount > 0 || hasVideoOrQuiz || !canAdvanceReading)
+                    readingProbeKey = null;
 
                 // 1. 若检测到登录过期或身份核验/验证码弹窗，立即停在原页并显示原因
                 if (snap.GuardBlocked)
@@ -217,13 +255,43 @@ namespace XuexitongDesktop
                     return snap;
                 }
 
-                // 3. 未找到视频时停在原页提示
+                // 3. 连续两次确认是教材或课件页，再滚动并点击页面的「下一节」。
                 if (snap.VideoCount == 0)
                 {
-                    snap.StatusMessage = "当前页面未找到可访问的视频，已停在原页。";
+                    if (autoPlayAndAdvance && canAdvanceReading && !hasVideoOrQuiz)
+                    {
+                        string key = browser.Source + "\n" + snap.ChapterTitle + "\n" + snap.StepTabTitle;
+                        if (lastReadingAdvanceKey == key)
+                        {
+                            snap.StatusMessage = "已点击「下一节」，正在等待章节切换。";
+                        }
+                        else if (readingProbeKey != key)
+                        {
+                            readingProbeKey = key;
+                            lastReadingAdvanceKey = null;
+                            snap.StatusMessage = "检测到教材或课件页，正在确认无需播放视频……";
+                        }
+                        else
+                        {
+                            string nextRaw = await browser.ExecuteScriptAsync(BuildInspectScript(false, true));
+                            if (version != playbackVersion || disposed) return snap;
+                            var nextData = serializer.Deserialize<Dictionary<string, object>>(serializer.Deserialize<string>(nextRaw));
+                            snap.SwitchedNextChapter = GetBool(nextData, "clickedReadingNext");
+                            if (snap.SwitchedNextChapter) lastReadingAdvanceKey = key;
+                            else readingProbeKey = null;
+                            snap.StatusMessage = snap.SwitchedNextChapter
+                                ? "已滚到教材或课件页底部，并点击「下一节」。"
+                                : "页面已变化，正在重新检查。";
+                        }
+                    }
+                    else
+                    {
+                        snap.StatusMessage = "未找到可访问的视频，当前页没有可自动前进的教材或课件。";
+                    }
                     UpdateUi(snap.ChapterTitle, snap.StatusMessage);
                     return snap;
                 }
+                lastReadingAdvanceKey = null;
 
                 // 4. 视频播放结束时的处理：必须核对平台任务完成状态才允许切章！
                 bool videoReachedEnd = snap.IsEnded || (snap.Duration > 0.5 && snap.CurrentTime >= snap.Duration - 0.15);
@@ -235,6 +303,7 @@ namespace XuexitongDesktop
                         if (autoPlayAndAdvance)
                         {
                             var advanceResult = await AdvanceToNextChapterAsync(browser);
+                            if (version != playbackVersion || disposed) return snap;
                             snap.SwitchedNextChapter = advanceResult.Item1;
                             snap.NextChapterTitle = advanceResult.Item2;
                             snap.CourseAllCompleted = advanceResult.Item3;
@@ -299,13 +368,13 @@ namespace XuexitongDesktop
                         snap.JobFinished ? " [平台标记：已完成]" : " [平台标记：学习中]");
                 }
 
-                UpdateUi(snap.ChapterTitle, snap.StatusMessage);
+                if (version == playbackVersion && !disposed) UpdateUi(snap.ChapterTitle, snap.StatusMessage);
                 return snap;
             }
             catch (Exception ex)
             {
                 snap.StatusMessage = "课程播放巡检异常：" + ex.Message;
-                UpdateUi(snap.ChapterTitle, snap.StatusMessage);
+                if (version == playbackVersion && !disposed) UpdateUi(snap.ChapterTitle, snap.StatusMessage);
                 return snap;
             }
         }
@@ -337,28 +406,47 @@ namespace XuexitongDesktop
         /// <summary>
         /// 暂停页面及其同源子框架中的所有视频，并返回当前章节标题。
         /// </summary>
-        private static async Task<string> PauseVideosInPageAsync(WebView2 view)
+        private static async Task<Tuple<string, bool>> PauseVideosInPageAsync(WebView2 view)
         {
             string script = @"(function(){
                 function clean(s){return String(s||'').replace(/\s+/g,' ').trim();}
+                var found=0;
+                var stillPlaying=0;
                 function scanPause(d,depth){
                     if(!d||depth>5)return;
                     try{
-                        d.querySelectorAll('video').forEach(function(v){try{v.pause();}catch(e){}});
+                        d.querySelectorAll('video').forEach(function(v){
+                            found++;
+                            v.setAttribute('data-csd-paused','');
+                            try{v.pause();}catch(e){}
+                            if(!v.paused) stillPlaying++;
+                        });
                         d.querySelectorAll('iframe').forEach(function(f){try{if(f.contentDocument)scanPause(f.contentDocument,depth+1);}catch(e){}});
                     }catch(e){}
                 }
                 scanPause(document,0);
                 var active=document.querySelector('#coursetree .posCatalog_active .posCatalog_name, .posCatalog_active .posCatalog_name, .posCatalog_active');
-                return active?clean(active.getAttribute('title')||active.innerText):'';
+                return JSON.stringify({chapter:active?clean(active.getAttribute('title')||active.innerText):'',found:found,stillPlaying:stillPlaying});
             })()";
+            var serializer = new JavaScriptSerializer();
             string raw = await view.ExecuteScriptAsync(script);
+            var top = serializer.Deserialize<Dictionary<string, object>>(serializer.Deserialize<string>(raw));
+            int found = GetInt(top, "found");
+            int stillPlaying = GetInt(top, "stillPlaying");
             foreach (var frame in WebViewFrameRegistry.GetAliveFrames(view))
             {
-                try { await WebViewFrameRegistry.ExecuteCourseFrameScriptAsync(frame, script); }
+                try
+                {
+                    string frameRaw = await WebViewFrameRegistry.ExecuteCourseFrameScriptAsync(frame, script);
+                    string frameJson = serializer.Deserialize<string>(frameRaw);
+                    if (String.IsNullOrEmpty(frameJson)) continue;
+                    var frameStatus = serializer.Deserialize<Dictionary<string, object>>(frameJson);
+                    found += GetInt(frameStatus, "found");
+                    stillPlaying += GetInt(frameStatus, "stillPlaying");
+                }
                 catch (Exception) { }
             }
-            return new JavaScriptSerializer().Deserialize<string>(raw);
+            return Tuple.Create(GetString(top, "chapter"), found > 0 && stillPlaying == 0);
         }
 
         /// <summary>
@@ -423,11 +511,12 @@ namespace XuexitongDesktop
         /// <summary>
         /// 生成在浏览器内执行的单步探测与控制 JS 脚本。
         /// </summary>
-        private static string BuildInspectScript(bool shouldPlay)
+        private static string BuildInspectScript(bool shouldPlay, bool advanceReading = false)
         {
             string playFlag = shouldPlay ? "true" : "false";
             return @"(function(){
                 var shouldPlay = " + playFlag + @";
+                var advanceReading = " + (advanceReading ? "true" : "false") + @";
                 function clean(s){return String(s||'').replace(/\s+/g,' ').trim();}
                 function isVisible(el){
                     if(!el||!el.isConnected)return false;
@@ -475,7 +564,7 @@ namespace XuexitongDesktop
                 // 2. 识别当前章节名称与当前步骤页签
                 var activeNode=document.querySelector('#coursetree .posCatalog_active .posCatalog_name, .posCatalog_active .posCatalog_name, .posCatalog_active, .chapter-item.active');
                 var chapterTitle=activeNode?clean(activeNode.getAttribute('title')||activeNode.innerText):clean(document.title);
-                var prevTitleEl=document.querySelector('.prev_title, .tabtags .active');
+                var prevTitleEl=document.querySelector('.tabtags .active, .tabtags [aria-selected=""true""]')||document.querySelector('.prev_title');
                 var stepTabTitle=prevTitleEl?clean(prevTitleEl.getAttribute('title')||prevTitleEl.innerText):'';
 
                 // 3. 查找所有可访问的视频元素
@@ -497,16 +586,61 @@ namespace XuexitongDesktop
 
                 // 若当前没有视频且存在“视频”页签，自动点击切换到视频页签
                 var switchedToVideoTab=false;
+                var tabs=Array.from(document.querySelectorAll('.prev_white, .tabtags span, .tabtags [role=""tab""]'));
+                var videoTabs=tabs.filter(function(tab){return /^(?:\d+\s*)?视频$/.test(clean(tab.innerText)) && isVisible(tab);});
                 if(!guardBlocked && videos.length===0 && shouldPlay){
-                    var tabs=Array.from(document.querySelectorAll('.prev_white, .tabtags span'));
-                    for(var t=0;t<tabs.length;t++){
-                        var tabText=clean(tabs[t].innerText);
-                        if((tabText==='视频'||tabText==='2视频') && isVisible(tabs[t]) && !tabs[t].classList.contains('active')){
-                            tabs[t].click();
+                    for(var t=0;t<videoTabs.length;t++){
+                        if(!videoTabs[t].classList.contains('active') && videoTabs[t].getAttribute('aria-selected')!=='true'){
+                            videoTabs[t].click();
                             switchedToVideoTab=true;
                             break;
                         }
                     }
+                }
+
+                var hasVideoOrQuiz=videos.length===0 && (videoTabs.length>0 || /视频|测验|考试|作业|讨论/.test(stepTabTitle) ||
+                    /测验|考试|作业/.test(chapterTitle) || docs.some(function(doc){
+                        return Array.from(doc.querySelectorAll('iframe[src*=""video"" i], [data-type=""video"" i], .singleQuesId, .TiMu, form.answer-box, input[type=""radio""], input[type=""checkbox""]')).some(isVisible);
+                    }));
+                function isNextButton(el){
+                    return isVisible(el) && !el.disabled && el.getAttribute('aria-disabled')!=='true' &&
+                        /^下一[节章]$/.test(clean(el.innerText||el.value||el.getAttribute('aria-label')));
+                }
+                var readingTab=/^(?:\d+\s*)?(?:教材|课件|图文|阅读|资料|讲义|文档|PPT)$/i.test(stepTabTitle);
+                // 无页签的教材正文在平台课程卡片内，翻页按钮在外层页面。
+                var readingPreview=/\/mycourse\/studentstudy(?:\.html)?\/?$/i.test(location.pathname) && docs.some(function(doc){
+                    if(doc===document || doc.readyState!=='complete' ||
+                        !/\/knowledge\/cards(?:\.html)?\/?$/i.test(doc.location.pathname) ||
+                        !isVisible(doc.defaultView.frameElement)) return false;
+                    var content=doc.querySelector('#pageDiv');
+                    if(!isVisible(content)) return false;
+                    var title=clean(doc.title);
+                    if(/^(教材|导读)$/.test(title)) return true;
+                    if(title || !clean(content.innerText) || content.querySelector('iframe,video,audio,object,embed,form,input,textarea,button,.ans-attach-ct,[data-type]'))
+                        return false;
+
+                    // 无标题时，只接受已加载的文字卡片。同节其他可见页签必须明确标为阅读类。
+                    var cardIndex=new URLSearchParams(doc.location.search).get('num');
+                    if(!/^\d+$/.test(cardIndex || '')) return false;
+                    var currentTabId='dct'+(Number(cardIndex)+1);
+                    var cardTabs=Array.from(document.querySelectorAll('[id^=""dct""]')).filter(function(tab){
+                        return /^dct\d+$/.test(tab.id) && isVisible(tab);
+                    });
+                    return cardTabs.some(function(tab){return tab.id===currentTabId;}) && cardTabs.every(function(tab){
+                        var label=clean(tab.getAttribute('title') || tab.getAttribute('aria-label') || tab.innerText);
+                        return /^(?:\d+\s*)?(?:教材|导读|课件|图文|阅读|资料|讲义|文档|PPT)$/i.test(label) ||
+                            (tab.id===currentTabId && /^\d*$/.test(label));
+                    });
+                });
+                var nextButton=[];
+                if(document.readyState==='complete' && !guardBlocked && !hasVideoOrQuiz && videos.length===0 && (readingTab || readingPreview))
+                    nextButton=Array.from(document.querySelectorAll('#prevNextFocusNext, #right1, .nextChapter, button, a, [role=""button""]')).filter(isNextButton);
+                var canAdvanceReading=nextButton.length===1;
+                var clickedReadingNext=false;
+                if(advanceReading && canAdvanceReading){
+                    nextButton[0].scrollIntoView({block:'end',behavior:'instant'});
+                    nextButton[0].click();
+                    clickedReadingNext=true;
                 }
 
                 var paused=true;
@@ -519,11 +653,13 @@ namespace XuexitongDesktop
                     currentTime=Number(v.currentTime||0);
                     duration=Number(v.duration||0);
                     if(!guardBlocked && shouldPlay && !ended && v.paused){
+                        v.removeAttribute('data-csd-paused');
                         try{v.playbackRate=2;}catch(e){}
                         try{
                             var p=v.play();
                             if(p&&typeof p.catch==='function'){
-                                p.catch(function(){
+                                p.catch(function(error){
+                                    if(!error || error.name!=='NotAllowedError' || v.hasAttribute('data-csd-paused')) return;
                                     try{v.muted=true;v.play().catch(function(){});}catch(e2){}
                                 });
                             }
@@ -564,6 +700,9 @@ namespace XuexitongDesktop
                     chapterTitle: chapterTitle,
                     stepTabTitle: stepTabTitle,
                     switchedToVideoTab: switchedToVideoTab,
+                    hasVideoOrQuiz: hasVideoOrQuiz,
+                    canAdvanceReading: canAdvanceReading,
+                    clickedReadingNext: clickedReadingNext,
                     videoCount: videos.length,
                     paused: paused,
                     ended: ended,

@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>学生学习页面</title>
+<iframe src="/mooc-ans/knowledge/cards.html?num=0" style="width:90%;height:2400px"></iframe>
+<button id="prevNextFocusNext">下一节</button>
+<script>
+// 记录翻页时滚动位置和点击次数。
+window.nextClicks = 0;
+window.wasScrolled = false;
+document.getElementById('prevNextFocusNext').onclick = function () {
+    window.nextClicks++;
+    window.wasScrolled = window.scrollY > 0 && this.getBoundingClientRect().bottom <= window.innerHeight;
+};
+</script>

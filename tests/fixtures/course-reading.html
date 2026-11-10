@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>课程阅读测试</title>
+<div class="tabtags"><span class="prev_white active">1 教材</span></div>
+<div style="height:2400px">课程教材示例</div>
+<button id="prevNextFocusNext">下一节</button>
+<script>
+window.nextClicks = 0;
+window.wasScrolled = false;
+document.getElementById('prevNextFocusNext').onclick = function () {
+    window.nextClicks++;
+    window.wasScrolled = window.scrollY > 0 && this.getBoundingClientRect().bottom <= window.innerHeight;
+};
+</script>
