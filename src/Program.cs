@@ -1,4 +1,4 @@
-﻿/*
+/*
  * 文件说明：Program.cs
  * 职责角色：本文件是学习通 Windows 桌面助手的程序入口与主窗口（MainWindow）。
  *           承载 WebView2 浏览器与独立持久化的用户登录目录（自动回退保护），并在主窗口与课程弹出子窗口中
@@ -441,7 +441,7 @@ namespace XuexitongDesktop
                 }
 
                 await browser.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(CoursePlayer.DefaultVideoSpeedScript);
-                AttachPopupHandler(browser, environment);
+                AttachPopupHandler(browser, environment, player);
                 browser.CoreWebView2.NavigationCompleted += async delegate(object s, CoreWebView2NavigationCompletedEventArgs args)
                 {
                     if (!args.IsSuccess)
@@ -462,12 +462,15 @@ namespace XuexitongDesktop
         }
 
         // 新窗口共享登录环境，同时具备完整的连续播放、开始答题和查题工具栏。
-        private void AttachPopupHandler(WebView2 source, CoreWebView2Environment environment)
+        private void AttachPopupHandler(WebView2 source, CoreWebView2Environment environment, CoursePlayer sourcePlayer)
         {
             WebViewFrameRegistry.Attach(source);
             source.CoreWebView2.NewWindowRequested += async delegate(object sender, CoreWebView2NewWindowRequestedEventArgs args)
             {
                 var deferral = args.GetDeferral();
+                Uri sourcePage = source.Source;
+                bool isVideoPreview = CoursePlayer.IsValidChaoxingUrl(source) &&
+                    CoursePlayer.IsVideoPreviewRequest(args.OriginalSourceFrameInfo == null ? null : args.OriginalSourceFrameInfo.Source, args.Uri);
                 Form popup = null;
                 try
                 {
@@ -476,7 +479,7 @@ namespace XuexitongDesktop
                     var popupStatus = new ToolStripStatusLabel("就绪");
                     var popupChapter = new ToolStripLabel("当前章节：子窗口");
                     var popupPlayer = new CoursePlayer(child, popupStatus, popupChapter);
-                    var toolbar = BuildToolbar(child, popup, popupStatus, popupChapter, popupPlayer, false);
+                    var toolbar = BuildToolbar(child, popup, popupStatus, popupChapter, isVideoPreview ? sourcePlayer : popupPlayer, false);
                     var popupStatusBar = new StatusStrip();
                     popupStatusBar.Items.Add(popupStatus);
 
@@ -488,14 +491,24 @@ namespace XuexitongDesktop
                     await child.EnsureCoreWebView2Async(environment);
                     await child.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(CoursePlayer.DefaultVideoSpeedScript);
                     WebViewFrameRegistry.Attach(child);
+                    bool openedAutomatically = !args.IsUserInitiated;
                     child.CoreWebView2.NavigationCompleted += async delegate(object s2, CoreWebView2NavigationCompletedEventArgs a2)
                     {
-                        if (a2.IsSuccess)
+                        if (a2.IsSuccess && isVideoPreview && openedAutomatically && !sourcePlayer.IsRunning &&
+                            !source.IsDisposed && Equals(source.Source, sourcePage))
+                            await sourcePlayer.PauseAsync();
+                        if (a2.IsSuccess && !isVideoPreview)
                         {
                             await popupPlayer.StepOnceAsync(false);
                         }
                     };
-                    AttachPopupHandler(child, environment);
+                    AttachPopupHandler(child, environment, popupPlayer);
+                    if (isVideoPreview)
+                    {
+                        sourcePlayer.TrackVideoPreview(child, sourcePage, new Uri(args.Uri));
+                        popupStatus.Text = "视频附件预览。连续播放和暂停由课程窗口统一控制。";
+                        popupChapter.Text = "视频附件";
+                    }
                     args.NewWindow = child.CoreWebView2;
                     args.Handled = true;
                 }

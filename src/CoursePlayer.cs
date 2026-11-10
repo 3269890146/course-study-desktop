@@ -63,6 +63,9 @@ namespace XuexitongDesktop
         private int playbackVersion;
         private int endedWithoutJobFinishTicks;
         private string readingProbeKey;
+        private WebView2 videoPreview;
+        private Uri previewChapter;
+        private Uri previewMedia;
         private string lastReadingAdvanceKey;
         private const int MaxWaitJobFinishTicks = 4;
 
@@ -122,7 +125,10 @@ namespace XuexitongDesktop
                     UpdateUi("", "请先打开学习通课程页面。");
                     return;
                 }
-                var result = await PauseVideosInPageAsync(browser);
+                var preview = GetCurrentVideoPreview();
+                var result = preview == null
+                    ? await PauseVideosInPageAsync(browser)
+                    : await PauseVideosInPageAsync(preview, GuardPreviewScript);
                 if (version != playbackVersion || disposed) return;
                 UpdateUi(result.Item1, result.Item2
                     ? "已暂停播放（点击「连续播放」可继续）。"
@@ -133,6 +139,43 @@ namespace XuexitongDesktop
                 if (version == playbackVersion && !disposed) UpdateUi("", "暂停视频失败：" + ex.Message);
             }
             finally { playbackGate.Release(); }
+        }
+
+        // 只接管学习通播放器打开的已知 MP4 预览，避免把普通外链当作课程视频。
+        internal static bool IsVideoPreviewRequest(string frameSource, string destination)
+        {
+            Uri frame;
+            Uri media;
+            return Uri.TryCreate(frameSource, UriKind.Absolute, out frame) &&
+                frame.Scheme == Uri.UriSchemeHttps &&
+                frame.Host.EndsWith(".chaoxing.com", StringComparison.OrdinalIgnoreCase) &&
+                frame.AbsolutePath == "/ananas/modules/video/index-video-pc.html" &&
+                Uri.TryCreate(destination, UriKind.Absolute, out media) &&
+                media.Scheme == Uri.UriSchemeHttps &&
+                media.Host.Equals("s2.cldisk.com", StringComparison.OrdinalIgnoreCase) &&
+                media.AbsolutePath.StartsWith("/sv-w2/video/", StringComparison.Ordinal) &&
+                media.AbsolutePath.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal void TrackVideoPreview(WebView2 preview, Uri chapter, Uri media)
+        {
+            videoPreview = preview;
+            previewChapter = chapter;
+            previewMedia = media;
+        }
+
+        private WebView2 GetCurrentVideoPreview()
+        {
+            if (videoPreview == null || videoPreview.IsDisposed || !Equals(previewChapter, browser.Source))
+                return null;
+            return videoPreview;
+        }
+
+        // 执行前再次核对地址，以免预览窗口在巡检期间导航到其他网页。
+        private string GuardPreviewScript(string script)
+        {
+            string address = new JavaScriptSerializer().Serialize(previewMedia.AbsoluteUri);
+            return "(function(){return location.href === " + address + " ? (" + script + ") : null;})()";
         }
 
         private async Task OnMonitorTickAsync()
@@ -170,7 +213,7 @@ namespace XuexitongDesktop
 
             try
             {
-                string inspectScript = BuildInspectScript(autoPlayAndAdvance);
+                string inspectScript = BuildInspectScript(autoPlayAndAdvance, openPreview: GetCurrentVideoPreview() == null);
                 string rawJson = await browser.ExecuteScriptAsync(inspectScript);
                 if (version != playbackVersion || disposed) return snap;
                 var serializer = new JavaScriptSerializer();
@@ -178,6 +221,7 @@ namespace XuexitongDesktop
                 var data = serializer.Deserialize<Dictionary<string, object>>(json);
                 bool canAdvanceReading = GetBool(data, "canAdvanceReading");
                 bool hasVideoOrQuiz = GetBool(data, "hasVideoOrQuiz");
+                bool hasVideoPreview = GetBool(data, "hasVideoPreview");
 
                 snap.GuardBlocked = GetBool(data, "guardBlocked");
                 snap.GuardReason = GetString(data, "guardReason");
@@ -204,6 +248,7 @@ namespace XuexitongDesktop
                         var fData = serializer.Deserialize<Dictionary<string, object>>(fJson);
                         if (fData == null) continue;
                         hasVideoOrQuiz |= GetBool(fData, "hasVideoOrQuiz");
+                        hasVideoPreview |= GetBool(fData, "hasVideoPreview");
 
                         if (GetBool(fData, "guardBlocked") && !snap.GuardBlocked)
                         {
@@ -251,6 +296,33 @@ namespace XuexitongDesktop
                 if (snap.SwitchedToVideoTab)
                 {
                     snap.StatusMessage = "已自动切换到「视频」页签，正在等待视频加载……";
+                    UpdateUi(snap.ChapterTitle, snap.StatusMessage);
+                    return snap;
+                }
+
+                // 附件播放器位于独立窗口。播完后只参考原课程当前章节的完成标记。
+                var preview = GetCurrentVideoPreview();
+                if (hasVideoPreview && preview != null && Equals(preview.Source, previewMedia))
+                {
+                    string previewRaw = await preview.ExecuteScriptAsync(GuardPreviewScript(BuildInspectScript(autoPlayAndAdvance)));
+                    if (version != playbackVersion || disposed || GetCurrentVideoPreview() != preview) return snap;
+                    string previewJson = serializer.Deserialize<string>(previewRaw);
+                    if (!String.IsNullOrEmpty(previewJson))
+                    {
+                        var previewData = serializer.Deserialize<Dictionary<string, object>>(previewJson);
+                        snap.VideoCount = GetInt(previewData, "videoCount");
+                        snap.IsPaused = GetBool(previewData, "paused");
+                        snap.IsEnded = GetBool(previewData, "ended");
+                        snap.CurrentTime = GetDouble(previewData, "currentTime");
+                        snap.Duration = GetDouble(previewData, "duration");
+                        snap.JobFinished = GetBool(data, "chapterFinished");
+                    }
+                }
+                if (snap.VideoCount == 0 && hasVideoPreview)
+                {
+                    snap.StatusMessage = preview != null
+                        ? "正在等待视频附件加载……"
+                        : "检测到视频附件。若预览窗口未打开，请点击橙色播放入口。";
                     UpdateUi(snap.ChapterTitle, snap.StatusMessage);
                     return snap;
                 }
@@ -310,6 +382,8 @@ namespace XuexitongDesktop
 
                             if (snap.SwitchedNextChapter)
                             {
+                                Form previewWindow = preview != null && !preview.IsDisposed ? preview.FindForm() : null;
+                                if (previewWindow != null) previewWindow.Close();
                                 snap.ChapterTitle = !String.IsNullOrEmpty(snap.NextChapterTitle) ? snap.NextChapterTitle : snap.ChapterTitle;
                                 snap.StatusMessage = "平台已确认本节完成，已自动切换到下一节：" + snap.ChapterTitle;
                             }
@@ -406,7 +480,7 @@ namespace XuexitongDesktop
         /// <summary>
         /// 暂停页面及其同源子框架中的所有视频，并返回当前章节标题。
         /// </summary>
-        private static async Task<Tuple<string, bool>> PauseVideosInPageAsync(WebView2 view)
+        private static async Task<Tuple<string, bool>> PauseVideosInPageAsync(WebView2 view, Func<string, string> guard = null)
         {
             string script = @"(function(){
                 function clean(s){return String(s||'').replace(/\s+/g,' ').trim();}
@@ -429,8 +503,10 @@ namespace XuexitongDesktop
                 return JSON.stringify({chapter:active?clean(active.getAttribute('title')||active.innerText):'',found:found,stillPlaying:stillPlaying});
             })()";
             var serializer = new JavaScriptSerializer();
-            string raw = await view.ExecuteScriptAsync(script);
-            var top = serializer.Deserialize<Dictionary<string, object>>(serializer.Deserialize<string>(raw));
+            string raw = await view.ExecuteScriptAsync(guard == null ? script : guard(script));
+            string json = serializer.Deserialize<string>(raw);
+            if (String.IsNullOrEmpty(json)) return Tuple.Create("", false);
+            var top = serializer.Deserialize<Dictionary<string, object>>(json);
             int found = GetInt(top, "found");
             int stillPlaying = GetInt(top, "stillPlaying");
             foreach (var frame in WebViewFrameRegistry.GetAliveFrames(view))
@@ -511,12 +587,13 @@ namespace XuexitongDesktop
         /// <summary>
         /// 生成在浏览器内执行的单步探测与控制 JS 脚本。
         /// </summary>
-        private static string BuildInspectScript(bool shouldPlay, bool advanceReading = false)
+        private static string BuildInspectScript(bool shouldPlay, bool advanceReading = false, bool openPreview = false)
         {
             string playFlag = shouldPlay ? "true" : "false";
             return @"(function(){
                 var shouldPlay = " + playFlag + @";
                 var advanceReading = " + (advanceReading ? "true" : "false") + @";
+                var openPreview = " + (openPreview ? "true" : "false") + @";
                 function clean(s){return String(s||'').replace(/\s+/g,' ').trim();}
                 function isVisible(el){
                     if(!el||!el.isConnected)return false;
@@ -598,7 +675,27 @@ namespace XuexitongDesktop
                     }
                 }
 
-                var hasVideoOrQuiz=videos.length===0 && (videoTabs.length>0 || /视频|测验|考试|作业|讨论/.test(stepTabTitle) ||
+                // 已观察到的附件预览入口与播放器同源。每个文档只触发一次，避免反复弹窗。
+                var previewLinks=docs.filter(function(doc){
+                    if(!/(^|\.)chaoxing\.com$/i.test(doc.location.hostname) ||
+                        doc.location.pathname!=='/ananas/modules/video/index-video-pc.html') return false;
+                    for(var view=doc.defaultView;view!==window;view=view.parent){
+                        if(!isVisible(view.frameElement)) return false;
+                    }
+                    return true;
+                }).map(function(doc){return doc.querySelector('a#render');}).filter(function(link){
+                    return isVisible(link) && (clean(link.getAttribute('title'))==='视频预览' ||
+                        clean(link.getAttribute('aria-label'))==='视频预览');
+                });
+                if(openPreview && shouldPlay && window===window.top && !guardBlocked && !switchedToVideoTab && videos.length===0 && previewLinks.length===1){
+                    var link=previewLinks[0];
+                    if(!link.ownerDocument.documentElement.hasAttribute('data-csd-preview-opened')){
+                        link.ownerDocument.documentElement.setAttribute('data-csd-preview-opened','');
+                        link.click();
+                    }
+                }
+
+                var hasVideoOrQuiz=videos.length===0 && (previewLinks.length>0 || videoTabs.length>0 || /视频|测验|考试|作业|讨论/.test(stepTabTitle) ||
                     /测验|考试|作业/.test(chapterTitle) || docs.some(function(doc){
                         return Array.from(doc.querySelectorAll('iframe[src*=""video"" i], [data-type=""video"" i], .singleQuesId, .TiMu, form.answer-box, input[type=""radio""], input[type=""checkbox""]')).some(isVisible);
                     }));
@@ -626,6 +723,10 @@ namespace XuexitongDesktop
                     var cardTabs=Array.from(document.querySelectorAll('[id^=""dct""]')).filter(function(tab){
                         return /^dct\d+$/.test(tab.id) && isVisible(tab);
                     });
+                    // 单张正文卡片可能没有页签，要求首张卡片和平台固定的翻页按钮。
+                    if(cardTabs.length===0)
+                        return cardIndex==='0' && tabs.every(function(tab){return !isVisible(tab);}) &&
+                            isNextButton(document.querySelector('#prevNextFocusNext'));
                     return cardTabs.some(function(tab){return tab.id===currentTabId;}) && cardTabs.every(function(tab){
                         var label=clean(tab.getAttribute('title') || tab.getAttribute('aria-label') || tab.innerText);
                         return /^(?:\d+\s*)?(?:教材|导读|课件|图文|阅读|资料|讲义|文档|PPT)$/i.test(label) ||
@@ -652,9 +753,11 @@ namespace XuexitongDesktop
                     ended=Boolean(v.ended);
                     currentTime=Number(v.currentTime||0);
                     duration=Number(v.duration||0);
+                    if(!guardBlocked && shouldPlay && !ended && v.playbackRate!==2){
+                        try{v.playbackRate=2;}catch(e){}
+                    }
                     if(!guardBlocked && shouldPlay && !ended && v.paused){
                         v.removeAttribute('data-csd-paused');
-                        try{v.playbackRate=2;}catch(e){}
                         try{
                             var p=v.play();
                             if(p&&typeof p.catch==='function'){
@@ -687,9 +790,11 @@ namespace XuexitongDesktop
                     if(jobFinished)break;
                 }
                 // 同时检查左侧课程树当前激活节点是否有完成标志
+                var chapterFinished=false;
                 if(activeNode){
                     var activeLi=activeNode.closest('.posCatalog_select, .chapter-item')||activeNode;
                     if(activeLi.querySelector('.icon_Completed, .ans-job-finished') || activeLi.getAttribute('data-job-finished')==='true'){
+                        chapterFinished=true;
                         jobFinished=true;
                     }
                 }
@@ -701,6 +806,8 @@ namespace XuexitongDesktop
                     stepTabTitle: stepTabTitle,
                     switchedToVideoTab: switchedToVideoTab,
                     hasVideoOrQuiz: hasVideoOrQuiz,
+                    hasVideoPreview: previewLinks.length>0,
+                    chapterFinished: chapterFinished,
                     canAdvanceReading: canAdvanceReading,
                     clickedReadingNext: clickedReadingNext,
                     videoCount: videos.length,

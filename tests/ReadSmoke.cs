@@ -56,6 +56,8 @@ internal sealed class ReadSmoke : Form
                 Console.WriteLine("PASS trusted frame allowed, external frame blocked");
                 await VerifyPlaybackPauseAsync();
                 await VerifyReadingAdvanceAsync();
+                await VerifyVideoPreviewAsync();
+                await VerifyLinkedVideoPreviewAsync(environment);
                 exitCode = 0;
             }
             catch (Exception ex) { Console.Error.WriteLine(ex); }
@@ -144,6 +146,17 @@ internal sealed class ReadSmoke : Form
                 throw new InvalidOperationException("无标题卡片处理错误，另一页签为" + otherTab);
         }
 
+        // 模拟只有一张无标题卡片、没有编号页签的真实章节。
+        await NavigateAsync("https://fixture.chaoxing.com/mycourse/studentstudy.html?case=single");
+        await browser.ExecuteScriptAsync("document.querySelector('iframe').contentDocument.title = ''");
+        await player.StepOnceAsync(true);
+        if (await browser.ExecuteScriptAsync("window.nextClicks") != "0")
+            throw new InvalidOperationException("单张正文首次检查不应翻页");
+        await player.StepOnceAsync(true);
+        await player.StepOnceAsync(true);
+        if (await browser.ExecuteScriptAsync("window.nextClicks === 1 && window.wasScrolled") != "true")
+            throw new InvalidOperationException("单张正文未滚动并点击一次下一节");
+
         await NavigateAsync(url + "?case=unknown");
         await browser.ExecuteScriptAsync("document.querySelector('.tabtags').remove()");
         await player.StepOnceAsync(true);
@@ -165,6 +178,85 @@ internal sealed class ReadSmoke : Form
         if (await browser.ExecuteScriptAsync("window.nextClicks") != "0")
             throw new InvalidOperationException("有测验时不应跳节");
         Console.WriteLine("PASS reading page advances once after scrolling; video and quiz pages stay put");
+    }
+
+    // 用实际 WebView2 弹窗事件验证附件只打开一次，且不被当成纯教材跳过。
+    private async Task VerifyVideoPreviewAsync()
+    {
+        await NavigateAsync("https://fixture.chaoxing.com/course-preview.html");
+        int requests = 0;
+        bool trusted = false;
+        EventHandler<CoreWebView2NewWindowRequestedEventArgs> handler = delegate(object sender, CoreWebView2NewWindowRequestedEventArgs args)
+        {
+            args.Handled = true;
+            requests++;
+            trusted = CoursePlayer.IsVideoPreviewRequest(args.OriginalSourceFrameInfo == null ? null : args.OriginalSourceFrameInfo.Source, args.Uri);
+        };
+        browser.CoreWebView2.NewWindowRequested += handler;
+        try
+        {
+            var player = new CoursePlayer(browser, new ToolStripStatusLabel(), new ToolStripLabel());
+            await player.StepOnceAsync(false);
+            if (requests != 0) throw new InvalidOperationException("只读巡检打开了视频附件");
+            await player.StepOnceAsync(true);
+            await player.StepOnceAsync(true);
+            if (requests != 1 || !trusted || await browser.ExecuteScriptAsync("window.nextClicks") != "0")
+                throw new InvalidOperationException("未从可信播放器打开一次附件，或错误触发翻页。弹窗次数：" + requests);
+            Console.WriteLine("PASS video preview opens once from the trusted frame");
+        }
+        finally { browser.CoreWebView2.NewWindowRequested -= handler; }
+    }
+
+    // 模拟独立窗口中的播放器，验证原课程可控且结束时仍要核对平台完成状态。
+    private async Task VerifyLinkedVideoPreviewAsync(CoreWebView2Environment environment)
+    {
+        const string mediaUrl = "https://s2.cldisk.com/sv-w2/video/test/sd.mp4";
+        await NavigateAsync("https://fixture.chaoxing.com/course-preview.html");
+
+        using (var preview = new WebView2())
+        {
+            Controls.Add(preview);
+            await preview.EnsureCoreWebView2Async(environment);
+            preview.CoreWebView2.AddWebResourceRequestedFilter(mediaUrl, CoreWebView2WebResourceContext.Document);
+            preview.CoreWebView2.WebResourceRequested += delegate(object sender, CoreWebView2WebResourceRequestedEventArgs args)
+            {
+                byte[] markup = System.Text.Encoding.UTF8.GetBytes("<video></video>");
+                args.Response = environment.CreateWebResourceResponse(new MemoryStream(markup), 200, "OK", "Content-Type: text/html");
+            };
+            var ready = new TaskCompletionSource<bool>();
+            preview.CoreWebView2.NavigationCompleted += delegate(object sender, CoreWebView2NavigationCompletedEventArgs args)
+            {
+                ready.TrySetResult(args.IsSuccess);
+            };
+            preview.CoreWebView2.Navigate(mediaUrl);
+            if (!await ready.Task) throw new InvalidOperationException("测试预览窗口加载失败");
+            await preview.ExecuteScriptAsync(@"(function(){
+                var video=document.querySelector('video');
+                window.mockPaused=false;
+                window.mockEnded=false;
+                Object.defineProperty(video,'paused',{get:function(){return window.mockPaused;}});
+                Object.defineProperty(video,'ended',{get:function(){return window.mockEnded;}});
+                video.pause=function(){window.mockPaused=true;};
+            })()");
+
+            var status = new ToolStripStatusLabel();
+            var player = new CoursePlayer(browser, status, new ToolStripLabel());
+            player.TrackVideoPreview(preview, browser.Source, new Uri(mediaUrl));
+            CourseStepSnapshot playing = await player.StepOnceAsync(true);
+            if (playing.VideoCount != 1 || playing.IsPaused ||
+                await preview.ExecuteScriptAsync("document.querySelector('video').playbackRate") != "2")
+                throw new InvalidOperationException("课程巡检没有接管预览播放");
+            await player.PauseAsync();
+            if (!status.Text.StartsWith("已暂停播放", StringComparison.Ordinal) ||
+                await preview.ExecuteScriptAsync("window.mockPaused") != "true")
+                throw new InvalidOperationException("课程暂停未传到附件播放器");
+            await preview.ExecuteScriptAsync("window.mockEnded=true");
+            for (int i = 0; i < 4; i++) await player.StepOnceAsync(true);
+            if (!status.Text.Contains("无法确认平台任务完成") ||
+                await browser.ExecuteScriptAsync("window.nextClicks") != "0")
+                throw new InvalidOperationException("附件播完但平台未确认时必须留在原页");
+        }
+        Console.WriteLine("PASS linked preview uses 2x, pauses, and waits for platform confirmation");
     }
 
     private async Task NavigateAsync(string url)
